@@ -1,0 +1,22 @@
+name: Bot scrapNews automático
+
+on:
+  schedule:
+    - cron: '0 11 * * *'    # Todos los días a las 9 AM Argentina (12 UTC)
+  workflow_dispatch:         # O lo podés disparar manualmente si querés probar
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run bot
+        env:
+          FIREBASE_CREDENTIALS: ${{ secrets.FIREBASE_CREDENTIALS }}
+        run: python autoupdate.py
