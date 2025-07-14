@@ -1,0 +1,6 @@
+pdfplumber
+requests
+beautifulsoup4
+lxml
+chardet
+firebase-admin
