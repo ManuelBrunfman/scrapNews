@@ -1,94 +1,141 @@
-import requests, os, hashlib, json, chardet
-from bs4 import BeautifulSoup
+import os, json, hashlib, requests, chardet
 from urllib.parse import urljoin
+from bs4 import BeautifulSoup
+
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# --- CONFIG ---------------------------------------------
-PAGE_URL   = "https://labancaria.org/sintesis-de-prensa/"
-HASH_FILE  = "last_page_hash.txt"
-# ---------------------------------------------------------
+###############################################
+# Configuración
+###############################################
+PAGE_URL = "https://labancaria.org/sintesis-de-prensa/"  # página que contiene los links
+HASH_FILE = "last_page_hash.txt"                         # para saber si ya la procesamos
+COLLECTION = "news"                                     # nombre esperado en tu app RN
 
-# Cargar credenciales de Firebase (desde secreto en Actions o archivo local para pruebas)
+# dominios que NO queremos guardar (propios, redes, etc.)
+SKIP_DOMAINS = [
+    "labancaria.org",
+    "facebook.com", "instagram.com", "twitter.com", "x.com",
+    "youtube.com", "youtu.be"
+]
+
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"}
+
+###############################################
+# Utilidades
+###############################################
+
 def load_credentials():
+    """Devuelve la ruta del JSON de credenciales, leyendo desde una variable de entorno
+    (GitHub Actions) o desde un archivo local si se corre a mano."""
     if "FIREBASE_CREDENTIALS" in os.environ:
         import tempfile
-        tmp = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".json")
-        tmp.write(os.environ["FIREBASE_CREDENTIALS"])
-        tmp.close()
-        return tmp.name
-    return "serviceAccountKey.json"   # para correr local
+        f = tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".json")
+        f.write(os.environ["FIREBASE_CREDENTIALS"])
+        f.close()
+        return f.name
+    return "serviceAccountKey.json"
 
-# Extraer todas las URLs de la síntesis de prensa (HTML)
-def extract_urls_from_page(url=PAGE_URL):
-    resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
 
-    post = soup.find("div", class_="entry-content") or soup  # por si cambia el theme
-    anchors = post.find_all("a", href=True)
-
-    urls = [a["href"].strip() for a in anchors
-            if a["href"].startswith(("http://", "https://"))]
-    return list(set(urls)), resp.text            # devuelvo el HTML para hashear
-
-# Sacar metadatos de cada noticia
-def get_metadata(url):
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        enc = chardet.detect(r.content)['encoding']
-        soup = BeautifulSoup(r.content.decode(enc, "replace"), "lxml")
-
-        title = (
-            soup.find("meta", property="og:title") or
-            soup.find("meta", attrs={"name": "twitter:title"}) or
-            soup.find("title")
-        )
-        title = title.get("content", "").strip() if title else (soup.title.string.strip() if soup.title else "")
-
-        desc = (
-            soup.find("meta", attrs={"name": "description"}) or
-            soup.find("meta", property="og:description") or
-            soup.find("meta", attrs={"name": "twitter:description"})
-        )
-        desc = desc.get("content", "").strip() if desc else ""
-
-        img  = (
-            soup.find("meta", property="og:image") or
-            soup.find("meta", attrs={"name": "twitter:image:src"})
-        )
-        img = img.get("content", "").strip() if img else ""
-        if img and not img.startswith(("http://", "https://")):
-            img = urljoin(url, img)
-
-        return {"title": title, "description": desc, "img": img, "link": url}
-    except Exception as e:
-        print(f"⚠️  Error con {url}: {e}")
-        return {"title": "", "description": "", "img": "", "link": url}
-
-# ------ helpers de hash para saber si la página cambió --------------
-def already_processed(new_hash):
+def already_processed(new_hash: str) -> bool:
     return os.path.isfile(HASH_FILE) and open(HASH_FILE).read().strip() == new_hash
 
-def save_new_hash(new_hash):
+
+def save_new_hash(new_hash: str):
     with open(HASH_FILE, "w") as f:
         f.write(new_hash)
 
-# ------ subida a Firestore -----------------------------------------
-def upload_json_to_firestore(path):
+###############################################
+# Scraping de la página principal
+###############################################
+
+def extract_urls_from_page(url: str = PAGE_URL):
+    resp = requests.get(url, timeout=15, headers=HEADERS)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    post = soup.find("div", class_="entry-content") or soup
+    urls = []
+    for a in post.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href.startswith(("http://", "https://")):
+            continue
+        if any(domain in href for domain in SKIP_DOMAINS):
+            continue
+        urls.append(href)
+    # eliminar duplicados
+    return list(set(urls)), resp.text
+
+###############################################
+# Obtener metadatos de cada noticia
+###############################################
+
+def get_metadata(link: str):
+    try:
+        r = requests.get(link, timeout=15, headers=HEADERS)
+        r.raise_for_status()
+        enc = chardet.detect(r.content)["encoding"] or "utf-8"
+        soup = BeautifulSoup(r.content.decode(enc, "replace"), "lxml")
+
+        def meta_content(*names):
+            for name in names:
+                tag = soup.find("meta", attrs=name) if isinstance(name, dict) else soup.find("meta", property=name)
+                if tag and tag.get("content"):
+                    return tag["content"].strip()
+            return ""
+
+        title = meta_content({"property": "og:title"}, {"name": "twitter:title"}) or (soup.title.string.strip() if soup.title else "")
+        description = meta_content({"name": "description"}, {"property": "og:description"}, {"name": "twitter:description"})
+        img = meta_content({"property": "og:image"}, {"name": "twitter:image:src"})
+        if img and not img.startswith(("http://", "https://")):
+            img = urljoin(link, img)
+
+        return {"title": title, "description": description, "img": img, "link": link}
+    except Exception as e:
+        print(f"⚠️  Error con {link}: {e}")
+        return {"title": "", "description": "", "img": "", "link": link}
+
+###############################################
+# Subir a Firestore (limpia colección primero)
+###############################################
+
+def clear_collection(col_ref):
+    """Borra documentos en lotes de 500 hasta que la colección quede vacía."""
+    deleted_total = 0
+    while True:
+        docs = list(col_ref.limit(500).stream())
+        if not docs:
+            break
+        for d in docs:
+            d.reference.delete()
+            deleted_total += 1
+        print(f"  Borrados {deleted_total} documentos…")
+    return deleted_total
+
+
+def upload_to_firestore(news_items):
     cred_path = load_credentials()
     if not firebase_admin._apps:
         firebase_admin.initialize_app(credentials.Certificate(cred_path))
     db = firestore.client()
 
-    noticias = json.load(open(path, encoding="utf-8"))
-    for n in noticias:
-        db.collection("noticias").add(n)
-        print("Noticia subida:", n.get("title", "")[:80])
+    col_ref = db.collection(COLLECTION)
+    # 1) Vaciar la colección antes de cargar las nuevas noticias
+    deleted = clear_collection(col_ref)
+    print(f"Colección limpia: {deleted} docs eliminados.")
+
+    # 2) Subir las noticias nuevas
+    for n in news_items:
+        n["createdAt"] = firestore.SERVER_TIMESTAMP  # timestamp para ordenar en la app
+        doc_id = hashlib.md5(n["link"].encode()).hexdigest()
+        col_ref.document(doc_id).set(n)
+        print("Noticia subida:", n["title"][:80])
     print("Subida completa ✔️")
 
-# ---------------------- MAIN ---------------------------------------
+###############################################
+# Main
+###############################################
+
 def main():
     urls, html = extract_urls_from_page()
     page_hash = hashlib.md5(html.encode()).hexdigest()
@@ -99,20 +146,21 @@ def main():
     save_new_hash(page_hash)
 
     print(f"▶️  {len(urls)} URLs encontradas. Procesando…")
-    news = []
-    for i, u in enumerate(urls, 1):
-        print(f"[{i}/{len(urls)}] {u}")
-        meta = get_metadata(u)
+    news_list = []
+    for i, url in enumerate(urls, 1):
+        print(f"[{i}/{len(urls)}] {url}")
+        meta = get_metadata(url)
         if meta["title"] or meta["description"]:
-            news.append(meta)
+            news_list.append(meta)
 
-    if news:
-        json.dump(news, open("noticias.json", "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=2)
-        print(f"JSON generado con {len(news)} noticias.")
-        upload_json_to_firestore("noticias.json")
+    if news_list:
+        with open("noticias.json", "w", encoding="utf-8") as f:
+            json.dump(news_list, f, ensure_ascii=False, indent=2)
+        print(f"JSON generado con {len(news_list)} noticias.")
+        upload_to_firestore(news_list)
     else:
         print("No se obtuvieron noticias válidas.")
+
 
 if __name__ == "__main__":
     main()
