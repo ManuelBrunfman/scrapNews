@@ -1,5 +1,5 @@
 import os, json, hashlib, requests, chardet
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 import firebase_admin
@@ -61,6 +61,9 @@ def extract_urls_from_page(url: str = PAGE_URL):
         if not href.startswith(("http://", "https://")):
             continue
         if any(domain in href for domain in SKIP_DOMAINS):
+            continue
+        # Omitir homepages o URLs sin ruta (ej. https://ejemplo.com/ )
+        if urlparse(href).path.strip("/") == "":
             continue
         urls.append(href)
     # eliminar duplicados
